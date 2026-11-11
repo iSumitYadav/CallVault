@@ -99,6 +99,11 @@ internal class VoipCaptureSession(
     /** Whether [recordStatus] has been logged for this call. */
     private var recordStatusLogged = false
     @Volatile private var nearRecord: AudioRecord? = null
+    /**
+     * Serializes near-microphone replacement, suspension, resume and shutdown.
+     * Never hold this lock while performing a blocking AudioRecord.read().
+     */
+    private val nearRecordLock = Any()
     @Volatile private var encoder: MediaCodec? = null
     @Volatile private var muxer: MediaMuxer? = null
     @Volatile private var muxThread: Thread? = null
@@ -219,42 +224,90 @@ internal class VoipCaptureSession(
      */
     fun setSuspended(on: Boolean) {
         if (!suspended.compareAndSet(!on, on)) return
+
         if (on) {
-            AppLogger.i(TAG, "VoIP capture suspended for a carrier call — releasing the mic, keeping the file")
-            val near = nearRecord
-            nearRecord = null
-            runCatching { near?.stop() }
-            runCatching { near?.release() }
-            if (near != null) {
-                CaptureAudit.released(nearAuditId)
-                // Zeroed, or stop() releases this same id a second time and the audit logs a
-                // misleading "already released, or never registered" line — in the exact record a
-                // stuck-microphone report is read from.
-                nearAuditId = 0
+            AppLogger.i(
+                TAG,
+                "VoIP capture suspended for a carrier call — releasing the mic, keeping the file"
+            )
+
+            // Serialize near-mic release against recovery and shutdown.
+            synchronized(nearRecordLock) {
+                val near = nearRecord
+                nearRecord = null
+
+                runCatching { near?.stop() }
+                runCatching { near?.release() }
+
+                if (near != null) {
+                    CaptureAudit.released(nearAuditId)
+                    nearAuditId = 0
+                }
             }
+
+            // Leave far-side handling unchanged.
             val far = farRecord
             farRecord = null
             runCatching { far?.stop() }
             runCatching { far?.release() }
+
         } else {
-            // The submix first: it is the one that can fail for a reason worth logging distinctly —
-            // the policy is unarmed — while the mic failing is almost always another app holding it.
+            // Existing far-side resume implementation — unchanged.
             val far = VoipAudioPolicy.createSink()
+
             if (far == null) {
-                AppLogger.w(TAG, "Could not re-open the far-party sink on resume; the rest of this call is near-side only")
+                AppLogger.w(
+                    TAG,
+                    "Could not re-open the far-party sink on resume; the rest of this call is near-side only"
+                )
             } else {
                 farRecord = far
                 runCatching { HostAudioRecord.start("VoIP far (resume)", far) }
             }
-            val near = newNearRecord()
-            if (near == null) {
-                AppLogger.w(TAG, "Could not re-take the mic on resume; the rest of this call is far-side only")
-            } else {
-                runCatching { HostAudioRecord.start("VoIP near (resume)", near) }
-                nearRecord = near
-                nearAuditId = CaptureAudit.opened("VoIP near capture (MIC, resumed)")
+
+            // Serialize near-mic acquisition against recovery and shutdown.
+            val nearResumed = synchronized(nearRecordLock) {
+                if (stopRequested.get()) {
+                    false
+                } else {
+                    val near = newNearRecord()
+
+                    if (near == null) {
+                        AppLogger.w(
+                            TAG,
+                            "Could not re-take the mic on resume; the rest of this call is far-side only"
+                        )
+                        false
+                    } else {
+                        try {
+                            HostAudioRecord.start("VoIP near (resume)", near)
+
+                            nearRecord = near
+                            nearAuditId = CaptureAudit.opened(
+                                "VoIP near capture (MIC, resumed)"
+                            )
+
+                            true
+                        } catch (t: Throwable) {
+                            runCatching { near.stop() }
+                            runCatching { near.release() }
+
+                            AppLogger.w(
+                                TAG,
+                                "Could not start near microphone on resume: " +
+                                    "${t.javaClass.simpleName}: ${t.message}"
+                            )
+
+                            false
+                        }
+                    }
+                }
             }
-            AppLogger.i(TAG, "VoIP capture resumed into the same file (near=${near != null} far=${far != null})")
+
+            AppLogger.i(
+                TAG,
+                "VoIP capture resumed into the same file (near=$nearResumed far=${far != null})"
+            )
         }
     }
 
@@ -459,24 +512,7 @@ internal class VoipCaptureSession(
                     }
 
                     if (tag == "near") {
-                        // A zero-length read can be transient during AudioFlinger startup.
-                        // Do not spin continuously or kill the feeder.
-                        if (r == 0) {
-                            consecutiveEmptyReads++
-                            if (consecutiveEmptyReads < 5) {
-                                try {
-                                    Thread.sleep(20L)
-                                } catch (e: InterruptedException) {
-                                    return@Thread
-                                }
-                                continue
-                            }
-                        }
-
-                        consecutiveEmptyReads = 0
-
-                        // Do not replace a record that another operation has already
-                        // suspended or replaced.
+                        // Do not recover a recorder that has already been replaced or suspended.
                         if (nearRecord !== record || suspended.get()) {
                             interrupted = true
                             break
@@ -488,20 +524,20 @@ internal class VoipCaptureSession(
                         )
 
                         val recoveryStart = System.nanoTime()
+
                         val platformSilenced = runCatching {
                             record.activeRecordingConfiguration?.isClientSilenced
                         }.getOrNull()
 
-                        val fresh = retakeMic(record)
+                        val fresh = replaceNearRecord(
+                            current = record,
+                            reason = "read failure ($r)",
+                            auditLabel = "VoIP near capture (MIC, recovered after read failure)"
+                        )
 
                         if (fresh != null) {
-                            CaptureAudit.released(nearAuditId)
-                            nearRecord = fresh
-                            nearAuditId = CaptureAudit.opened(
-                                "VoIP near capture (MIC, recovered after read failure)"
-                            )
-
                             val gap = System.nanoTime() - recoveryStart
+
                             side.retake(gap, platformSilenced)
 
                             AppLogger.i(
@@ -511,22 +547,27 @@ internal class VoipCaptureSession(
                                     "gap=${gap / 1_000_000L}ms, " +
                                     "read=$r, silenced=$platformSilenced"
                             )
-
-                            current = fresh
-                            frameIndex = 0L
                         } else {
-                            AppLogger.w(
-                                TAG,
-                                "VoIP near recovery failed; will retry without ending feeder"
-                            )
+                            // Retry only if this recorder is still the active one.
+                            if (
+                                !stopRequested.get() &&
+                                !suspended.get() &&
+                                nearRecord === record
+                            ) {
+                                AppLogger.w(
+                                    TAG,
+                                    "VoIP near recovery failed; will retry without ending feeder"
+                                )
 
-                            try {
-                                Thread.sleep(250L)
-                            } catch (e: InterruptedException) {
-                                return@Thread
+                                try {
+                                    Thread.sleep(250L)
+                                } catch (e: InterruptedException) {
+                                    return@Thread
+                                }
                             }
                         }
 
+                        // The outer loop must detect the replacement and execute side.newRecord().
                         interrupted = true
                         break
                     }
@@ -569,26 +610,42 @@ internal class VoipCaptureSession(
                 if (isAllZero(buf)) { silentChunks++; side.zeroChunk() } else silentChunks = 0
                 if (silentChunks >= SILENT_CHUNKS_BEFORE_RETAKE) {
                     silentChunks = 0
-                    // Asked BEFORE the re-take, of the record that went quiet: did Android silence it, or is
-                    // this a pause? Recorded only (backlog #9, step 1) — the re-take happens either way, as
-                    // before. Null when the platform will not say.
-                    val platformSilenced = runCatching { record.activeRecordingConfiguration?.isClientSilenced }.getOrNull()
+
+                    // Capture Android's status before replacing the recorder.
+                    val platformSilenced = runCatching {
+                        record.activeRecordingConfiguration?.isClientSilenced
+                    }.getOrNull()
+
                     val retakeStart = System.nanoTime()
-                    val fresh = retakeMic(record)
+
+                    val fresh = replaceNearRecord(
+                        current = record,
+                        reason = "sustained all-zero PCM",
+                        auditLabel = "VoIP near capture (MIC, re-taken)"
+                    )
+
                     if (fresh != null) {
-                        // The gap is what the near side loses: from the last chunk of the old record
-                        // to the fresh one being started. Its first read adds one buffer on top.
                         val gap = System.nanoTime() - retakeStart
+
                         side.retake(gap, platformSilenced)
-                        AppLogger.i(TAG, "VoIP sync: re-take #${side.retakes} at ${(retakeStart - startedNanos) / 1_000_000L}ms took ${gap / 1_000_000L}ms; ${side.zeroChunks} zero chunks so far; Android says silenced=$platformSilenced")
-                        // The platform took the mic away and we opened another. Without closing the
-                        // old id and opening a new one, every re-take would read as a leaked capture
-                        // — and this happens several times in a normal call.
-                        CaptureAudit.released(nearAuditId)
-                        // Only the field now; the loop re-reads it next pass. Keeping a local copy
-                        // in step was the old shape and would now be a second source of truth.
-                        nearRecord = fresh
-                        nearAuditId = CaptureAudit.opened("VoIP near capture (MIC, re-taken)")
+
+                        AppLogger.i(
+                            TAG,
+                            "VoIP sync: re-take #${side.retakes} at " +
+                                "${(retakeStart - startedNanos) / 1_000_000L}ms " +
+                                "took ${gap / 1_000_000L}ms; " +
+                                "${side.zeroChunks} zero chunks so far; " +
+                                "Android says silenced=$platformSilenced"
+                        )
+                    } else if (
+                        !stopRequested.get() &&
+                        !suspended.get() &&
+                        nearRecord === record
+                    ) {
+                        AppLogger.w(
+                            TAG,
+                            "VoIP near zero-PCM recovery failed; retaining current recorder"
+                        )
                     }
                 }
             }
@@ -624,38 +681,136 @@ internal class VoipCaptureSession(
     }
 
     /**
-     * Closes the silenced capture and opens a fresh one, which makes us the most recent starter.
-     * Returns null (and leaves the old one running) if the new capture cannot be opened, so a failure
-     * here degrades to today's behaviour rather than ending the recording.
+     * Replaces the active near microphone atomically.
+     *
+     * Only the currently installed recorder may be replaced.
+     * Suspension and shutdown cannot race with the replacement.
      */
-    private fun retakeMic(current: AudioRecord): AudioRecord? {
-        // "Went quiet", not "silenced": most re-takes follow a pause, not the platform (2026-09-23 note);
-        // the caller logs Android's own answer.
-        AppLogger.i(TAG, "near capture went quiet for ${SILENT_CHUNKS_BEFORE_RETAKE} chunks — re-taking the mic")
-        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        if (minBuf <= 0) return null
-        val fresh = HostAudioRecord.open(
-            "VoIP mic re-take", MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT, minBuf * BUFFER_FACTOR,
-        )
-        if (fresh == null || fresh.state != AudioRecord.STATE_INITIALIZED) {
-            AppLogger.w(TAG, "re-take failed to initialise; keeping the silenced capture")
-            runCatching { fresh?.release() }
-            return null
+    private fun replaceNearRecord(
+        current: AudioRecord,
+        reason: String,
+        auditLabel: String
+    ): AudioRecord? = synchronized(nearRecordLock) {
+
+        if (
+            stopRequested.get() ||
+            suspended.get() ||
+            nearRecord !== current
+        ) {
+            AppLogger.d(
+                TAG,
+                "Skipping near recovery: recorder changed, suspended or stopping"
+            )
+            return@synchronized null
         }
-        try {
-            HostAudioRecord.start("VoIP mic re-take", fresh)
-        } catch (t: Throwable) {
+
+        // Start a replacement while the old recorder is still available.
+        val fresh = retakeMic(reason)
+            ?: return@synchronized null
+
+        // Check again because suspension or shutdown may have been requested
+        // while the replacement recorder was being initialized.
+        if (
+            stopRequested.get() ||
+            suspended.get() ||
+            nearRecord !== current
+        ) {
+            runCatching { fresh.stop() }
+            runCatching { fresh.release() }
+
             AppLogger.w(
                 TAG,
-                "re-take could not start microphone: ${t.javaClass.simpleName}: ${t.message}"
+                "Discarding replacement microphone because capture is suspended or stopping"
             )
-            runCatching { fresh.release() }
-            return null
+
+            return@synchronized null
         }
+
+        // Install the new recorder before releasing the old one.
+        nearRecord = fresh
+
+        CaptureAudit.released(nearAuditId)
+        nearAuditId = CaptureAudit.opened(auditLabel)
 
         runCatching { current.stop() }
         runCatching { current.release() }
+
+        AppLogger.i(
+            TAG,
+            "VoIP near microphone replaced successfully: reason=$reason"
+        )
+
+        fresh
+    }
+
+    /**
+     * Opens and starts a replacement MIC recorder.
+     *
+     * Does not release the existing recorder.
+     * Ownership transfer and old-recorder cleanup are handled by
+     * replaceNearRecord() under nearRecordLock.
+     */
+    private fun retakeMic(reason: String): AudioRecord? {
+        AppLogger.i(
+            TAG,
+            "near microphone recovery requested: $reason"
+        )
+
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        if (minBuf <= 0) {
+            AppLogger.w(
+                TAG,
+                "near microphone recovery: invalid minBufferSize=$minBuf"
+            )
+            return null
+        }
+
+        val fresh = HostAudioRecord.open(
+            "VoIP mic re-take",
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBuf * BUFFER_FACTOR
+        )
+
+        if (fresh == null || fresh.state != AudioRecord.STATE_INITIALIZED) {
+            AppLogger.w(
+                TAG,
+                "near microphone recovery failed to initialise replacement"
+            )
+
+            runCatching { fresh?.release() }
+            return null
+        }
+
+        try {
+            HostAudioRecord.start("VoIP mic re-take", fresh)
+
+            if (fresh.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException(
+                    "Replacement AudioRecord did not enter RECORDSTATE_RECORDING"
+                )
+            }
+
+        } catch (t: Throwable) {
+            AppLogger.w(
+                TAG,
+                "near microphone replacement could not start: " +
+                    "${t.javaClass.simpleName}: ${t.message}"
+            )
+
+            runCatching { fresh.stop() }
+            runCatching { fresh.release() }
+
+            return null
+        }
+
         return fresh
     }
 
@@ -699,9 +854,21 @@ internal class VoipCaptureSession(
         runCatching { muxThread?.join(STOP_JOIN_MS) }
         runCatching { farRecord?.stop() }
         CaptureAudit.released(farAuditId, runCatching { farRecord?.release() }.exceptionOrNull())
-        runCatching { nearRecord?.stop() }
-        CaptureAudit.released(nearAuditId, runCatching { nearRecord?.release() }.exceptionOrNull())
-        farAuditId = 0; nearAuditId = 0
+        synchronized(nearRecordLock) {
+            val near = nearRecord
+            nearRecord = null
+
+            runCatching { near?.stop() }
+
+            CaptureAudit.released(
+                nearAuditId,
+                runCatching { near?.release() }.exceptionOrNull()
+            )
+
+            nearAuditId = 0
+        }
+
+        farAuditId = 0
         runCatching { encoder?.stop() }; runCatching { encoder?.release() }
         runCatching { muxer?.stop() }    // writes the trailer — without it the file won't play
         runCatching { muxer?.release() }
