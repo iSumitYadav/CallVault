@@ -19,6 +19,8 @@ import com.baba.callvault.data.recordings.RecordingCatalog
 import com.baba.callvault.services.recording.RecordingNotificationHelper
 import com.baba.callvault.utils.AppLogger
 
+import com.baba.callvault.LocalBuildConfig
+
 /**
  * Copies a finished recording from the local SAF folder to the Drive SAF folder and, when the storage
  * target is cloud-only, deletes the local source afterwards.
@@ -34,6 +36,10 @@ import com.baba.callvault.utils.AppLogger
 class RecordingCopyWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
     override suspend fun doWork(): Result {
+        if (!LocalBuildConfig.ENABLE_DRIVE_SYNC) {
+            AppLogger.i(TAG, "Drive copy disabled in this local build")
+            return Result.success()
+        }
         val src = inputData.getString(KEY_SRC)?.toUri() ?: return Result.failure()
         val destFolder = inputData.getString(KEY_DEST_FOLDER)?.toUri() ?: return Result.failure()
         val name = inputData.getString(KEY_NAME) ?: return Result.failure()

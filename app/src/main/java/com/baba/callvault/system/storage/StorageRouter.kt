@@ -23,6 +23,8 @@ import com.baba.callvault.data.SyncScheduleMode
 import com.baba.callvault.utils.AppLogger
 import java.util.concurrent.TimeUnit
 
+import com.baba.callvault.LocalBuildConfig
+
 /** Routes a finished recording to the configured destination. LOCAL = no-op (already on device).
  *  For DRIVE/BOTH the cadence depends on the sync schedule: IMMEDIATE enqueues a per-recording copy to
  *  the Drive SAF folder (DRIVE also deletes local); DAILY/WEEKLY leave the file on device and rely on the
@@ -31,6 +33,10 @@ object StorageRouter {
     private const val TAG = "CV:StorageRouter"
 
     fun route(context: Context, localUri: Uri, displayName: String, mimeType: String) {
+        if (!LocalBuildConfig.ENABLE_DRIVE_SYNC) {
+            AppLogger.i(TAG, "Drive sync disabled; keeping recording local")
+            return
+        }
         // An imported file is the user's own audio, not a call we recorded, and under DRIVE the copy
         // is followed by a delete of the local original — so routing one would take their file off
         // the phone. Same gate as the scheduled sweep; see [CloudCopyPolicy.mayGoToCloud].
@@ -85,6 +91,10 @@ object StorageRouter {
      * derived from it); [sidecarName] is the actual file to copy.
      */
     fun routeSidecar(context: Context, recordingName: String, sidecarName: String, mimeType: String) {
+        if (!LocalBuildConfig.ENABLE_DRIVE_SYNC) {
+            AppLogger.i(TAG, "Drive sidecar sync disabled; keeping file local")
+            return
+        }
         if (!CloudCopyPolicy.mayGoToCloud(recordingName)) return
         val prefs = AppPreferences(context)
         val target = prefs.getStorageTarget()

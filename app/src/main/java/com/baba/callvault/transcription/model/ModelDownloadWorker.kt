@@ -31,6 +31,8 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
+import com.baba.callvault.LocalBuildConfig
+
 /**
  * Downloads a model, resumably, and installs it only once it hashes correctly.
  *
@@ -55,6 +57,10 @@ class ModelDownloadWorker(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        if (!LocalBuildConfig.ENABLE_MODEL_DOWNLOADS) {
+            AppLogger.i(TAG, "Model downloads disabled in this local build")
+            return@withContext Result.failure()
+        }
         val model = requestedModel()
             ?: run {
                 AppLogger.e(TAG, "Model download started with no model named; nothing to fetch")

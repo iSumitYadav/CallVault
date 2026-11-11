@@ -20,6 +20,8 @@ import com.baba.callvault.data.StorageTarget
 import com.baba.callvault.data.recordings.RecordingCatalog
 import com.baba.callvault.utils.AppLogger
 
+import com.baba.callvault.LocalBuildConfig
+
 /**
  * Batch/scheduled equivalent of [RecordingCopyWorker]. Walks the device recording folder and copies
  * every audio file that is not yet present (by display name) in the Drive folder, using the same
@@ -32,6 +34,10 @@ import com.baba.callvault.utils.AppLogger
 class SyncSweepWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
 
     override suspend fun doWork(): Result {
+        if (!LocalBuildConfig.ENABLE_DRIVE_SYNC) {
+            AppLogger.i(TAG, "Drive sweep disabled in this local build")
+            return Result.success()
+        }
         val prefs = AppPreferences(applicationContext)
         val target = prefs.getStorageTarget()
         if (target == StorageTarget.LOCAL) {

@@ -15,6 +15,8 @@ import com.baba.callvault.data.AppPreferences
 import com.baba.callvault.utils.AppLogger
 import java.io.File
 
+import com.baba.callvault.LocalBuildConfig
+
 /**
  * Orchestrates the in-app update flow shared by the periodic worker and the Home banner:
  *
@@ -61,6 +63,10 @@ object UpdateManager {
      * @return the newer release when one exists, else null.
      */
     fun checkForUpdate(context: Context, reconcile: Boolean = true): GitHubReleases.ReleaseInfo? {
+        if (!LocalBuildConfig.ENABLE_IN_APP_UPDATER) {
+            AppLogger.i(TAG, "Updater disabled in local build")
+            return null
+        }
         val preferences = AppPreferences(context)
         if (reconcile) reconcilePendingState(context, preferences)
 
@@ -93,6 +99,10 @@ object UpdateManager {
         allowInteractiveFallback: Boolean,
         onProgress: (Int) -> Unit = {}
     ): Boolean {
+        if (!LocalBuildConfig.ENABLE_IN_APP_UPDATER) {
+            AppLogger.i(TAG, "Update installation disabled in local build")
+            return false
+        }
         val preferences = AppPreferences(context)
         val apk = downloadFile(context, release.tag)
         // A resumable partial persists across attempts, but only for THIS release — clear others.

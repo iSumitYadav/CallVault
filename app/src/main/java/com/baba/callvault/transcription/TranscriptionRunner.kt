@@ -34,6 +34,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 
+import com.baba.callvault.LocalBuildConfig
+
 /**
  * Turns audio into stored segments. Substituted in tests, because the real one loads a native
  * library a JVM test cannot.
@@ -160,6 +162,10 @@ class TranscriptionRunner(
         // A cloud engine (issue #48) skips everything that exists to repair or time whisper.cpp on this
         // phone, and sends no contact name: the prompt is more than a service needs to hear.
         val isCloud = CloudEndpoint.isCloudEngineId(modelId)
+        if (isCloud && !LocalBuildConfig.ENABLE_CLOUD_TRANSCRIPTION) {
+            AppLogger.w(TAG, "Cloud transcription is disabled in this local build")
+            return false
+        }
         // The checkpoint. A resumed run re-offers everything it was given, so finished work must be
         // recognised and skipped rather than paid for twice.
         if (dao.findTranscript(displayName)?.state == TranscriptState.DONE) {
