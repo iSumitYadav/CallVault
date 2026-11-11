@@ -421,6 +421,7 @@ internal class VoipCaptureSession(
         val tag = side.name
         val buf = ByteArray(CHUNK_BYTES)
         var silentChunks = 0
+        var consecutiveEmptyReads = 0
         var current: AudioRecord? = null
         var frameIndex = 0L
         var firstReadLogged = false
@@ -446,14 +447,96 @@ internal class VoipCaptureSession(
             var off = 0
             var interrupted = false
             while (off < CHUNK_BYTES && !stopRequested.get()) {
-                val r = runCatching { record.read(buf, off, CHUNK_BYTES - off) }.getOrDefault(-1)
+                val r = runCatching {
+                    record.read(buf, off, CHUNK_BYTES - off)
+                }.getOrDefault(AudioRecord.ERROR_INVALID_OPERATION)
+
                 if (r <= 0) {
-                    // A failed read while suspending is the record being released underneath us, not
-                    // a fault. Go back to waiting instead of ending the thread for good.
-                    if (suspended.get() || stopRequested.get()) { interrupted = true; break }
-                    AppLogger.d(TAG, "$tag read=$r, feeder ending")
+                    // The record may be released while a carrier call suspends capture.
+                    if (suspended.get() || stopRequested.get()) {
+                        interrupted = true
+                        break
+                    }
+
+                    if (tag == "near") {
+                        // A zero-length read can be transient during AudioFlinger startup.
+                        // Do not spin continuously or kill the feeder.
+                        if (r == 0) {
+                            consecutiveEmptyReads++
+                            if (consecutiveEmptyReads < 5) {
+                                try {
+                                    Thread.sleep(20L)
+                                } catch (e: InterruptedException) {
+                                    return@Thread
+                                }
+                                continue
+                            }
+                        }
+
+                        consecutiveEmptyReads = 0
+
+                        // Do not replace a record that another operation has already
+                        // suspended or replaced.
+                        if (nearRecord !== record || suspended.get()) {
+                            interrupted = true
+                            break
+                        }
+
+                        AppLogger.w(
+                            TAG,
+                            "near read=$r; attempting microphone recovery"
+                        )
+
+                        val recoveryStart = System.nanoTime()
+                        val platformSilenced = runCatching {
+                            record.activeRecordingConfiguration?.isClientSilenced
+                        }.getOrNull()
+
+                        val fresh = retakeMic(record)
+
+                        if (fresh != null) {
+                            CaptureAudit.released(nearAuditId)
+                            nearRecord = fresh
+                            nearAuditId = CaptureAudit.opened(
+                                "VoIP near capture (MIC, recovered after read failure)"
+                            )
+
+                            val gap = System.nanoTime() - recoveryStart
+                            side.retake(gap, platformSilenced)
+
+                            AppLogger.i(
+                                TAG,
+                                "VoIP near recovered after read failure; " +
+                                    "retake #${side.retakes}, " +
+                                    "gap=${gap / 1_000_000L}ms, " +
+                                    "read=$r, silenced=$platformSilenced"
+                            )
+
+                            current = fresh
+                            frameIndex = 0L
+                        } else {
+                            AppLogger.w(
+                                TAG,
+                                "VoIP near recovery failed; will retry without ending feeder"
+                            )
+
+                            try {
+                                Thread.sleep(250L)
+                            } catch (e: InterruptedException) {
+                                return@Thread
+                            }
+                        }
+
+                        interrupted = true
+                        break
+                    }
+
+                    // Keep the existing far-side failure behaviour unchanged.
+                    AppLogger.w(TAG, "$tag read=$r, feeder ending")
                     return@Thread
                 }
+
+                consecutiveEmptyReads = 0
                 off += r
             }
             if (interrupted) continue
@@ -560,7 +643,17 @@ internal class VoipCaptureSession(
             runCatching { fresh?.release() }
             return null
         }
-        runCatching { HostAudioRecord.start("VoIP mic re-take", fresh) }
+        try {
+            HostAudioRecord.start("VoIP mic re-take", fresh)
+        } catch (t: Throwable) {
+            AppLogger.w(
+                TAG,
+                "re-take could not start microphone: ${t.javaClass.simpleName}: ${t.message}"
+            )
+            runCatching { fresh.release() }
+            return null
+        }
+
         runCatching { current.stop() }
         runCatching { current.release() }
         return fresh
